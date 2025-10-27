@@ -3,7 +3,7 @@ pipeline {
         label 'arathi-docker-agent'
     }
     environment {
-        DOCKERHUB_USER = 'arathi-devsecops'
+        DOCKERHUB_USER = 'arathi'
         IMAGE_NAME = 'jenkins-docker-lab'
     }
     stages {
