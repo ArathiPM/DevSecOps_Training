@@ -2,6 +2,10 @@ pipeline {
     agent {
         label 'arathi-docker-agent'
     }
+    triggers {
+    pollSCM('H/3 * * * *') // checks every 3 mins, or
+    // OR use GitHub webhook instead (recommended)
+    }
     environment {
         DOCKERHUB_USER = 'arathi'
         IMAGE_NAME = 'jenkins-docker-lab'
@@ -21,6 +25,21 @@ pipeline {
                 script {
                     sh 'docker build -t $DOCKERHUB_USER/$IMAGE_NAME:latest python-app'
                 }
+            }
+        }
+        stage('Scan Docker Image with Trivy') {
+            steps {
+                // Scan and save report
+                sh '''
+                  mkdir -p trivy-reports
+                  trivy image --no-progress --exit-code 0 --format table -o trivy-reports/report.txt $DOCKERHUB_USER/$IMAGE_NAME
+                  cat trivy-reports/report.txt
+                '''
+            }
+        }
+        stage('Archive Trivy Report') {
+            steps {
+                archiveArtifacts artifacts: 'trivy-reports/report.txt', fingerprint: true
             }
         }
     }
