@@ -2,54 +2,178 @@ pipeline {
     agent {
         label 'arathi-ubuntu-a'
     }
-    triggers {
-    pollSCM('H/3 * * * *') // checks every 3 mins, or
-    // OR use GitHub webhook instead (recommended)
-    }
+
     environment {
+        // Artifact directories
         DOCKERHUB_USER = 'arathi'
         IMAGE_NAME = 'jenkins-docker-lab'
+        REPORT_DIR = "scan-reports"
+        IMAGE_VULN = "vulnerable-app:v1"
+        IMAGE_SECURE = "vulnerable-app:v2-secure"
     }
+
     stages {
-        stage('Clean up image and container') {
+        stage('Setup Workspace') {
             steps {
                 script {
-               //     sh 'git clone git@github.com:Vishwanathms/t7.14-py-jenkins.git'
-                    sh 'docker rm  jenkins_app -f || true'
-                    sh 'docker image rmi $DOCKERHUB_USER/$IMAGE_NAME:latest || true'
-                }
-            }  
-        }
-        stage('Build Docker Image') {
-            steps {
-                script {
-                    sh 'docker build -t $DOCKERHUB_USER/$IMAGE_NAME:latest python-app'
+                    sh """
+                    mkdir -p vulnerable-app
+                    cd vulnerable-app
+
+                    # Create vulnerable Flask app
+                    cat > app.py << 'EOF'
+                    from flask import Flask
+                    import requests
+                    app = Flask(__name__)
+                    @app.route('/')
+                    def hello():
+                        return "Hello from Vulnerable App!"
+                    if __name__ == '__main__':
+                        app.run(host='0.0.0.0', port=5000)
+                    EOF
+
+                    # Create vulnerable Dockerfile
+                    cat > Dockerfile << 'EOF'
+                    FROM python:3.9-slim
+                    WORKDIR /app
+                    RUN pip install flask==2.0.1 requests==2.25.1
+                    COPY app.py .
+                    EXPOSE 5000
+                    CMD ["python", "app.py"]
+                    EOF
+                    """
                 }
             }
         }
-        stage('Scan Docker Image with Trivy') {
+
+        stage('Build Vulnerable Image') {
             steps {
-                // Scan and save report
-                sh '''
-                  mkdir -p trivy-reports
-                  trivy image --no-progress --exit-code 0 --format table -o trivy-reports/report.txt $DOCKERHUB_USER/$IMAGE_NAME
-                  cat trivy-reports/report.txt
-                '''
+                dir('vulnerable-app') {
+                    sh "docker build -t ${IMAGE_VULN} ."
+                    sh "docker images | grep vulnerable-app || true"
+                }
             }
         }
-        stage('Archive Trivy Report') {
+
+        stage('Scan Vulnerable Image') {
             steps {
-                archiveArtifacts artifacts: 'trivy-reports/report.txt', fingerprint: true
+                dir('vulnerable-app') {
+                    sh """
+                    trivy image --severity HIGH,CRITICAL \
+                      --format json \
+                      --output trivy-before.json \
+                      ${IMAGE_VULN}
+
+                    mkdir -p ../${REPORT_DIR}
+                    mv trivy-before.json ../${REPORT_DIR}/
+                    """
+                }
+            }
+        }
+
+        stage('Create Secure Dockerfile and Build') {
+            steps {
+                dir('vulnerable-app') {
+                    sh """
+                    cat > Dockerfile.secure << 'EOF'
+                    FROM python:3.11-slim
+                    RUN useradd -m -u 1000 appuser
+                    WORKDIR /app
+                    COPY app.py .
+                    RUN pip install --no-cache-dir \\
+                        flask==3.0.0 \\
+                        requests==2.31.0
+                    RUN chown -R appuser:appuser /app
+                    USER appuser
+                    EXPOSE 5000
+                    CMD ["python", "app.py"]
+                    EOF
+
+                    docker build -f Dockerfile.secure -t ${IMAGE_SECURE} .
+                    """
+                }
+            }
+        }
+
+        stage('Functional Test of Secure Image') {
+            steps {
+                sh """
+                docker run -d --name test-secure -p 5000:5000 ${IMAGE_SECURE}
+                sleep 5
+                curl -s http://localhost:5000 | grep "Hello from Vulnerable App" || true
+                docker stop test-secure && docker rm test-secure
+                """
+            }
+        }
+
+        stage('Scan Secure Image (Post-Remediation)') {
+            steps {
+                dir('vulnerable-app') {
+                    sh """
+                    trivy image --severity HIGH,CRITICAL \
+                      --format json \
+                      --output trivy-after.json \
+                      ${IMAGE_SECURE}
+                    
+                    mv trivy-after.json ../${REPORT_DIR}/
+                    """
+                }
+            }
+        }
+
+        stage('Compare Vulnerability Results') {
+            steps {
+                dir(REPORT_DIR) {
+                    sh """
+                    echo "=== Vulnerability Comparison ==="
+                    BEFORE=\$(grep -i "VulnerabilityID" trivy-before.json | wc -l)
+                    AFTER=\$(grep -i "VulnerabilityID" trivy-after.json | wc -l)
+                    echo "BEFORE (v1): \$BEFORE vulnerabilities"
+                    echo "AFTER (v2-secure): \$AFTER vulnerabilities"
+
+                    if [ "\$BEFORE" -gt 0 ]; then
+                        REDUCTION=\$(echo "scale=2; 100 - (\$AFTER / \$BEFORE * 100)" | bc -l)
+                        echo "Reduction: \$REDUCTION %"
+                    fi
+                    """
+                }
+            }
+        }
+
+        stage('Archive Scan Artifacts') {
+            steps {
+                dir('vulnerable-app') {
+                    sh """
+                    cp Dockerfile ../${REPORT_DIR}/Dockerfile.v1
+                    cp Dockerfile.secure ../${REPORT_DIR}/Dockerfile.v2-secure
+                    """
+                }
+                archiveArtifacts artifacts: "${REPORT_DIR}/**", fingerprint: true
+            }
+        }
+
+        stage('Optional: Run Configuration Scans') {
+            steps {
+                dir('vulnerable-app') {
+                    sh """
+                    trivy config --severity HIGH,CRITICAL Dockerfile > ../${REPORT_DIR}/Dockerfile_v1_config.txt || true
+                    trivy config --severity HIGH,CRITICAL Dockerfile.secure > ../${REPORT_DIR}/Dockerfile_v2_config.txt || true
+                    """
+                }
             }
         }
     }
- 
+
     post {
+        always {
+            echo "Cleaning up Docker images and containers..."
+            sh "docker system prune -f"
+        }
         success {
-            echo 'Pipeline completed successfully!'
+            echo "Trivy Scan Pipeline completed successfully."
         }
         failure {
-            echo 'Pipeline failed.'
+            echo "Pipeline failed. Check logs and artifacts for diagnostic info."
         }
     }
 }
