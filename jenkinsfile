@@ -13,13 +13,17 @@ pipeline {
     }
 
     stages {
-        stage('Setup Workspace') {
-    steps {
-        sh '''
-        mkdir -p vulnerable-app
-        cd vulnerable-app
 
-        echo "from flask import Flask
+        /* -----------------------------------------------------------
+           SETUP WORKSPACE
+        ------------------------------------------------------------ */
+        stage('Setup Workspace') {
+            steps {
+                sh '''
+                mkdir -p vulnerable-app
+                cd vulnerable-app
+
+                echo "from flask import Flask
 import requests
 app = Flask(__name__)
 @app.route('/')
@@ -29,46 +33,61 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
 " > app.py
 
-        echo "FROM python:3.9-slim
+                echo "FROM python:3.9-slim
 WORKDIR /app
 RUN pip install flask==2.0.1 requests==2.25.1
 COPY app.py .
 EXPOSE 5000
 CMD [\\"python\\", \\"app.py\\"]
 " > Dockerfile
-        '''
-    }
-}
+                '''
+            }
+        }
+
+        /* -----------------------------------------------------------
+           BUILD VULNERABLE IMAGE
+        ------------------------------------------------------------ */
         stage('Build Vulnerable Image') {
             steps {
                 dir('vulnerable-app') {
-                    sh "docker build -t ${IMAGE_VULN} ."
-                    sh "docker images | grep vulnerable-app || true"
+                    sh '''
+                    docker build -t ${IMAGE_VULN} .
+                    echo ""
+                    docker images | grep vulnerable-app
+                    '''
                 }
             }
         }
 
+        /* -----------------------------------------------------------
+           TRIVY SCAN - VULNERABLE IMAGE
+        ------------------------------------------------------------ */
         stage('Scan Vulnerable Image') {
             steps {
                 dir('vulnerable-app') {
-                    sh """
-                    trivy image --severity HIGH,CRITICAL \
-                      --format json \
-                      --output trivy-before.json \
-                      ${IMAGE_VULN}
+                    sh '''
+                    echo ""
+                    echo "==================== VULNERABLE IMAGE SCAN ===================="
+                    trivy image --severity HIGH,CRITICAL --format table ${IMAGE_VULN} | tee ../${REPORT_DIR}_v1_table.txt || true
 
+                    echo ""
+                    echo "==================== GENERATING JSON REPORT ==================="
                     mkdir -p ../${REPORT_DIR}
-                    mv trivy-before.json ../${REPORT_DIR}/
-                    """
+                    trivy image --severity HIGH,CRITICAL --format json \
+                        --output ../${REPORT_DIR}/trivy-before.json ${IMAGE_VULN}
+                    '''
                 }
             }
         }
 
+        /* -----------------------------------------------------------
+           CREATE & BUILD SECURE IMAGE
+        ------------------------------------------------------------ */
         stage('Create Secure Dockerfile and Build') {
-    steps {
-        dir('vulnerable-app') {
-            sh '''
-            echo "FROM python:3.11-slim
+            steps {
+                dir('vulnerable-app') {
+                    sh '''
+                    echo "FROM python:3.11-slim
 RUN useradd -m -u 1000 appuser
 WORKDIR /app
 COPY app.py .
@@ -79,91 +98,104 @@ EXPOSE 5000
 CMD [\\"python\\", \\"app.py\\"]
 " > Dockerfile.secure
 
-            docker build -f Dockerfile.secure -t vulnerable-app:v2-secure .
-            '''
+                    docker build -f Dockerfile.secure -t ${IMAGE_SECURE} .
+                    '''
+                }
+            }
         }
-    }
-}
 
+        /* -----------------------------------------------------------
+           FUNCTIONAL TEST - SECURE IMAGE
+        ------------------------------------------------------------ */
         stage('Functional Test of Secure Image') {
             steps {
-                sh """
+                sh '''
                 docker run -d --name test-secure -p 5000:5000 ${IMAGE_SECURE}
                 sleep 5
-                curl -s http://localhost:5000 | grep "Hello from Vulnerable App" || true
+                echo "===== Application Test Output ====="
+                curl -s http://localhost:5000 || true
                 docker stop test-secure && docker rm test-secure
-                """
+                '''
             }
         }
 
-        stage('Scan Secure Image (Post-Remediation)') {
+        /* -----------------------------------------------------------
+           TRIVY SCAN - SECURE IMAGE
+        ------------------------------------------------------------ */
+        stage('Scan Secure Image (Post‑Remediation)') {
             steps {
                 dir('vulnerable-app') {
-                    sh """
-                    trivy image --severity HIGH,CRITICAL \
-                      --format json \
-                      --output trivy-after.json \
-                      ${IMAGE_SECURE}
-                    
-                    mv trivy-after.json ../${REPORT_DIR}/
-                    """
+                    sh '''
+                    echo ""
+                    echo "===================== SECURE IMAGE SCAN ======================="
+                    trivy image --severity HIGH,CRITICAL --format table ${IMAGE_SECURE} | tee ../${REPORT_DIR}_v2_table.txt || true
+
+                    echo ""
+                    echo "===================== GENERATING JSON REPORT =================="
+                    trivy image --severity HIGH,CRITICAL --format json \
+                        --output ../${REPORT_DIR}/trivy-after.json ${IMAGE_SECURE}
+                    '''
                 }
             }
         }
 
+        /* -----------------------------------------------------------
+           COMPARE SCAN RESULTS
+        ------------------------------------------------------------ */
         stage('Compare Vulnerability Results') {
             steps {
-                dir(REPORT_DIR) {
-                    sh """
-                    echo "=== Vulnerability Comparison ==="
-                    BEFORE=\$(grep -i "VulnerabilityID" trivy-before.json | wc -l)
-                    AFTER=\$(grep -i "VulnerabilityID" trivy-after.json | wc -l)
-                    echo "BEFORE (v1): \$BEFORE vulnerabilities"
-                    echo "AFTER (v2-secure): \$AFTER vulnerabilities"
+                sh '''
+                echo ""
+                echo "===================== SUMMARY COMPARISON ======================"
+                BEFORE=$(grep -i "VulnerabilityID" ${REPORT_DIR}/trivy-before.json | wc -l || echo 0)
+                AFTER=$(grep -i "VulnerabilityID" ${REPORT_DIR}/trivy-after.json | wc -l || echo 0)
+                if [ "$BEFORE" -eq 0 ]; then BEFORE=0; fi
+                if [ "$AFTER" -eq 0 ]; then AFTER=0; fi
 
-                    if [ "\$BEFORE" -gt 0 ]; then
-                        REDUCTION=\$(echo "scale=2; 100 - (\$AFTER / \$BEFORE * 100)" | bc -l)
-                        echo "Reduction: \$REDUCTION %"
-                    fi
-                    """
-                }
+                printf "\\n| %-25s | %-15s |\\n" "Image Version" "Vulnerabilities"
+                printf "| %-25s | %-15s |\\n" "------------------------" "---------------"
+                printf "| %-25s | %-15s |\\n" "vulnerable-app:v1" "$BEFORE"
+                printf "| %-25s | %-15s |\\n" "vulnerable-app:v2-secure" "$AFTER"
+                echo ""
+
+                if [ "$BEFORE" -gt 0 ]; then
+                  REDUCTION=$(echo "scale=2; 100 - ($AFTER / $BEFORE * 100)" | bc -l)
+                  echo "Reduction Achieved: ${REDUCTION}%"
+                fi
+                echo ""
+                echo "===================== TOP REMAINING CVEs ======================"
+                jq -r '.Results[].Vulnerabilities[]? | [.VulnerabilityID,.PkgName,.Severity] | @tsv' ${REPORT_DIR}/trivy-after.json | \
+                    column -t -s $'\\t' | head -20 || true
+                '''
             }
         }
 
+        /* -----------------------------------------------------------
+           ARCHIVE REPORTS
+        ------------------------------------------------------------ */
         stage('Archive Scan Artifacts') {
             steps {
                 dir('vulnerable-app') {
-                    sh """
+                    sh '''
                     cp Dockerfile ../${REPORT_DIR}/Dockerfile.v1
                     cp Dockerfile.secure ../${REPORT_DIR}/Dockerfile.v2-secure
-                    """
+                    '''
                 }
                 archiveArtifacts artifacts: "${REPORT_DIR}/**", fingerprint: true
-            }
-        }
-
-        stage('Optional: Run Configuration Scans') {
-            steps {
-                dir('vulnerable-app') {
-                    sh """
-                    trivy config --severity HIGH,CRITICAL Dockerfile > ../${REPORT_DIR}/Dockerfile_v1_config.txt || true
-                    trivy config --severity HIGH,CRITICAL Dockerfile.secure > ../${REPORT_DIR}/Dockerfile_v2_config.txt || true
-                    """
-                }
             }
         }
     }
 
     post {
         always {
-            echo "Cleaning up Docker images and containers..."
-            sh "docker system prune -f"
+            echo "Cleaning up images and build cache..."
+            sh 'docker system prune -f'
         }
         success {
-            echo "Trivy Scan Pipeline completed successfully."
+            echo "Trivy scan pipeline completed successfully."
         }
         failure {
-            echo "Pipeline failed. Check logs and artifacts for diagnostic info."
+            echo "Pipeline failed — check console tables above."
         }
     }
 }
